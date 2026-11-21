@@ -1,5 +1,5 @@
 // Production solver: turns products + recipes + available resources into machine counts.
-import { recipeById, standardRecipe, isRaw, BUILDINGS } from './data.js'
+import { recipeById, standardRecipe, isRaw, BUILDINGS, nm as nameOf } from './data.js'
 
 const EPS = 1e-6
 const POWER_EXP = 1.321929
@@ -153,10 +153,43 @@ function allocatePerfect(chains, avail, caps, prio, shared, upper) {
 
 // ---------- main entry ----------
 // products: [{id, target}] ; choice: {item: recipeId} ; avail: {raw: rate} ; mode ; prio
-export function solve({ products, choice, avail, mode, prio }) {
+// Target mode + 100 %: smallest build with every machine at exactly 100 % that meets every target.
+function perfectForTargets(chains, caps) {
+  const stepIds = [...new Set(chains.flatMap((c) => Object.keys(c.steps)))]
+  const lo = caps.map((c) => Math.max(1, Math.ceil(c - 1e-6)))
+  const hi = lo.map((v) => v * 4 + 4)
+  let total = hi.reduce((p, h, i) => p * (h - lo[i] + 1), 1)
+  while (total > 400000) {
+    const k = hi.map((h, i) => h - lo[i]).reduce((b, v, i, a) => (v > a[b] ? i : b), 0)
+    hi[k] = lo[k] + Math.floor((hi[k] - lo[k]) * 0.8)
+    total = hi.reduce((p, h, i) => p * (h - lo[i] + 1), 1)
+  }
+  let best = null, bestScore = Infinity
+  const n = lo.slice()
+  const rec = (k) => {
+    if (k === chains.length) {
+      for (const s of stepIds) {
+        const m = n.reduce((acc, v, i) => acc + v * (chains[i].steps[s] || 0), 0)
+        if (Math.abs(m - Math.round(m)) > 1e-4) return
+      }
+      const sc = n.reduce((a, v, i) => a + v / caps[i], 0)
+      if (sc < bestScore - EPS) { bestScore = sc; best = n.slice() }
+      return
+    }
+    for (let v = lo[k]; v <= hi[k]; v++) { n[k] = v; rec(k + 1) }
+  }
+  rec(0)
+  return best
+}
+
+export function solve({ products, choice, avail, mode, prio, targetMode }) {
   const notes = []
   const chains = products.map((p) => unitChain(p.id, choice))
   const caps = products.map((p, i) => (p.target > 0 ? p.target / chains[i].rate : Infinity))
+  if (targetMode) {
+    avail = {}
+    chains.forEach((c) => Object.keys(c.raw).forEach((r) => (avail[r] = Infinity)))
+  }
   const shared = sharedInput(chains)
   let pr = prio
   if (!pr || chains.length < 2) pr = { type: 'order', order: chains.map((_, i) => i) }
@@ -168,7 +201,24 @@ export function solve({ products, choice, avail, mode, prio }) {
     x = x.map((v) => (Number.isFinite(v) ? v : 0))
   }
   let usedMode = mode
-  if (mode === 'perfect') {
+  if (mode === 'perfect' && targetMode) {
+    const best = perfectForTargets(chains, caps)
+    const ratio = best ? Math.max(...best.map((v, i) => v / caps[i])) : Infinity
+    if (best && ratio > 2 + 1e-6) {
+      usedMode = 'max'
+      notes.push('The nearest build with every machine at exactly 100 % would make ' +
+        products.map((p, i) => `${(best[i] * chains[i].rate).toFixed(2).replace(/\.?0+$/, '')}/min ${nameOf(p.id)}`).join(', ') +
+        ' – more than double your target. Showing your exact target instead, with one machine per step underclocked.')
+    } else if (best) {
+      const exact = best.every((v, i) => Math.abs(v - caps[i]) < 1e-6)
+      x = best
+      if (!exact) notes.push('Your exact target can\'t be made with every machine at exactly 100 %. This is the smallest perfect build that meets it: ' +
+        products.map((p, i) => `${(best[i] * chains[i].rate).toFixed(2).replace(/\.?0+$/, '')}/min ${nameOf(p.id)} (target ${p.target})`).join(', ') + '.')
+    } else {
+      usedMode = 'max'
+      notes.push('No perfect 100 % build found near your target. Showing your exact target with one machine per step underclocked.')
+    }
+  } else if (mode === 'perfect') {
     // upper bound per product: what it could do alone
     const upper = chains.map((_, i) => {
       const o = chains.map((__, j) => (j === i ? 0 : 1))

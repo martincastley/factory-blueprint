@@ -14,9 +14,14 @@ const MODES = [
   { id: 'lowpower', t: 'Lowest power', d: 'Same output as max, with all machines in a step evenly underclocked.' },
 ]
 
+const TARGET_DESC = {
+  perfect: 'Every machine at exactly 100 %. If your target can\'t be hit that way, uses the smallest perfect build above it.',
+  max: 'Exactly your target rate. Each step has at most one underclocked machine.',
+}
+
 const DEFAULT = {
   products: [], recipeMode: {}, choice: {}, supply: {}, belt: 2, pipe: 1,
-  prioKind: 'equal', prioFirst: 0, custom: 50, mode: 'perfect', step: 0,
+  prioKind: 'equal', prioFirst: 0, custom: 50, mode: 'perfect', step: 0, sizing: 'resources',
 }
 function load() { try { return { ...DEFAULT, ...JSON.parse(localStorage.getItem('bp-planner') || '{}') } } catch { return DEFAULT } }
 
@@ -26,13 +31,26 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('bp-planner', JSON.stringify(S)) } catch { /* ignore */ } }, [S])
 
   const beltCap = BELTS[S.belt - 1].rate, pipeCap = PIPES[S.pipe - 1].rate
-  const products = S.products.map((p) => ({ id: p.id, target: +p.target || 0 }))
+  const targetMode = S.sizing === 'target'
+  const products = S.products.map((p) => ({ id: p.id, target: targetMode ? +p.target || 0 : 0 }))
   const choice = useMemo(() => {
     const c = {}
-    S.products.forEach((p) => { if (S.recipeMode[p.id] === 'alt' && S.choice[p.id]) c[p.id] = S.choice[p.id] })
+    Object.keys(S.recipeMode).forEach((id) => { if (S.recipeMode[id] === 'alt' && S.choice[id]) c[id] = S.choice[id] })
     return c
-  }, [S.products, S.recipeMode, S.choice])
+  }, [S.recipeMode, S.choice])
   const chains = useMemo(() => products.map((p) => unitChain(p.id, choice)), [S.products, choice]) // eslint-disable-line react-hooks/exhaustive-deps
+  // every craftable item in the build (products first), so each can get its own recipe choice
+  const chainItems = useMemo(() => {
+    const list = S.products.map((p) => p.id)
+    chains.forEach((c) => Object.keys(c.steps).forEach((id) => !list.includes(id) && list.push(id)))
+    return list
+  }, [chains, S.products])
+  // target mode: resources needed for the targets
+  const need = useMemo(() => {
+    const n = {}
+    chains.forEach((c, i) => Object.entries(c.raw).forEach(([r, q]) => (n[r] = (n[r] || 0) + q * (products[i].target / c.rate))))
+    return n
+  }, [chains, S.products, S.sizing]) // eslint-disable-line react-hooks/exhaustive-deps
   const shared = useMemo(() => sharedInput(chains), [chains])
   const rawNeeded = useMemo(() => [...new Set(chains.flatMap((c) => Object.keys(c.raw)))], [chains])
 
@@ -61,21 +79,21 @@ export default function App() {
     return { type: 'share', weights: Array(n).fill(1 / n) }
   }, [products.length, shared.kind, S.prioKind, S.prioFirst, S.custom]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const steps = ['products', 'recipes', 'resources', ...(shared.kind === 'linked' ? ['priority'] : []), 'optimize', 'result']
+  const steps = ['products', 'recipes', 'resources', ...(shared.kind === 'linked' && !targetMode ? ['priority'] : []), 'optimize', 'result']
   const stepIdx = Math.min(S.step, steps.length - 1)
   const cur = steps[stepIdx]
 
   const canNext = {
-    products: S.products.length > 0,
-    recipes: S.products.every((p) => S.recipeMode[p.id] !== 'alt' || S.choice[p.id]),
-    resources: rawNeeded.every((r) => avail[r] > 0 || products.every((p) => p.target > 0)) && rawNeeded.every((r) => avail[r] > 0),
+    products: S.products.length > 0 && (!targetMode || products.every((p) => p.target > 0)),
+    recipes: chainItems.every((id) => S.recipeMode[id] !== 'alt' || S.choice[id]),
+    resources: targetMode || rawNeeded.every((r) => avail[r] > 0),
     priority: true, optimize: true, result: true,
   }[cur]
 
   const plan = useMemo(() => {
     if (!S.products.length || cur !== 'result' && cur !== 'optimize') return null
-    try { return solve({ products, choice, avail, mode: S.mode, prio }) } catch (e) { console.error(e); return null }
-  }, [cur, S.products, choice, avail, S.mode, prio]) // eslint-disable-line react-hooks/exhaustive-deps
+    try { return solve({ products, choice, avail, mode: S.mode, prio, targetMode }) } catch (e) { console.error(e); return null }
+  }, [cur, S.products, choice, avail, S.mode, prio, targetMode]) // eslint-disable-line react-hooks/exhaustive-deps
   const layout = useMemo(() => (plan && cur === 'result' && plan.steps.length ? buildLayout(plan, beltCap, pipeCap) : null), [plan, cur, beltCap, pipeCap])
   const title = S.products.map((p) => nm(p.id)).join(' + ') || 'NEW FACTORY'
 
@@ -94,11 +112,11 @@ export default function App() {
       <div className="body">
         <aside className="panel">
           {cur === 'products' && <Products S={S} set={set} />}
-          {cur === 'recipes' && <Recipes S={S} set={set} />}
-          {cur === 'resources' && <Resources S={S} set={set} raw={rawNeeded} avail={avail} chains={chains} beltCap={beltCap} pipeCap={pipeCap} />}
+          {cur === 'recipes' && <Recipes S={S} set={set} items={chainItems} />}
+          {cur === 'resources' && <Resources S={S} set={set} raw={rawNeeded} avail={avail} chains={chains} beltCap={beltCap} pipeCap={pipeCap} targetMode={targetMode} need={need} />}
           {cur === 'priority' && <Priority S={S} set={set} shared={shared} />}
-          {cur === 'optimize' && <Optimize S={S} set={set} products={products} choice={choice} avail={avail} prio={prio} />}
-          {cur === 'result' && plan && <Result plan={plan} layout={layout} avail={avail} />}
+          {cur === 'optimize' && <Optimize S={S} set={set} products={products} choice={choice} avail={avail} prio={prio} targetMode={targetMode} />}
+          {cur === 'result' && plan && <Result plan={plan} layout={layout} avail={avail} targetMode={targetMode} />}
           <div className="nav">
             {stepIdx > 0 && <button className="ghost" onClick={() => set({ step: stepIdx - 1 })}>← Back</button>}
             {cur !== 'result' && <button className="primary" disabled={!canNext} onClick={() => set({ step: stepIdx + 1 })}>{steps[stepIdx + 1] === 'result' ? 'Generate blueprint →' : 'Next →'}</button>}
@@ -132,24 +150,37 @@ function Products({ S, set }) {
   const matches = ql ? PRODUCIBLE.filter((id) => nm(id).toLowerCase().includes(ql) && !S.products.some((p) => p.id === id))
     .sort((a, b) => rank(a) - rank(b)).slice(0, 8) : []
   const add = (id) => { set((s) => ({ products: [...s.products, { id, target: '' }] })); setQ('') }
+  const target = S.sizing === 'target'
   return (
     <section>
       <h2>What are you making?</h2>
-      <p className="lead">Add one or more products. Leave the rate empty to make as much as your resources allow.</p>
+      <p className="lead">First, how should the build be sized?</p>
+      <label className={'opt' + (!target ? ' on' : '')}>
+        <input type="radio" checked={!target} onChange={() => set({ sizing: 'resources' })} />
+        <div><b>Use what my resources allow</b><div className="muted">You enter your nodes; the plan makes as much as they can supply.</div></div>
+      </label>
+      <label className={'opt' + (target ? ' on' : '')}>
+        <input type="radio" checked={target} onChange={() => set({ sizing: 'target' })} />
+        <div><b>I want a specific amount</b><div className="muted">You set a rate per product; the plan tells you what resources it needs.</div></div>
+      </label>
+      <h3>Products</h3>
       <div className="search">
-        <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search, e.g. Steel Beam"
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search, e.g. Steel Beam"
           onKeyDown={(e) => e.key === 'Enter' && matches[0] && add(matches[0])} />
         {matches.length > 0 && <ul className="dropdown">{matches.map((id) => <li key={id} onClick={() => add(id)}>{nm(id)}</li>)}</ul>}
       </div>
       {S.products.map((p, i) => (
         <div className="card row" key={p.id}>
           <b className="grow">{nm(p.id)}</b>
-          <input className="num small" type="number" min="0" placeholder="max" value={p.target}
-            onChange={(e) => set((s) => ({ products: s.products.map((x, j) => (j === i ? { ...x, target: e.target.value } : x)) }))} />
-          <span className="muted">{unit(p.id)}</span>
+          {target && <>
+            <input className={'num small' + (+p.target > 0 ? '' : ' need')} type="number" min="0" placeholder="rate" value={p.target}
+              onChange={(e) => set((s) => ({ products: s.products.map((x, j) => (j === i ? { ...x, target: e.target.value } : x)) }))} />
+            <span className="muted">{unit(p.id)}</span>
+          </>}
           <button className="x" onClick={() => set((s) => ({ products: s.products.filter((_, j) => j !== i) }))}>×</button>
         </div>
       ))}
+      {target && S.products.some((p) => !(+p.target > 0)) && <div className="hint">Enter a target rate for each product.</div>}
     </section>
   )
 }
@@ -159,29 +190,34 @@ function io(r) {
   return `${f(r.in)} → ${f(r.out)}`
 }
 
-function Recipes({ S, set }) {
+function Recipes({ S, set, items }) {
+  const productIds = S.products.map((p) => p.id)
+  const setMode = (id, m) => set((s) => ({ recipeMode: { ...s.recipeMode, [id]: m } }))
   return (
     <section>
       <h2>Recipes</h2>
-      <p className="lead">Standard or alternate recipe for each product? Intermediate parts use standard recipes for now.</p>
-      {S.products.map((p) => {
-        const alts = altRecipes(p.id)
-        const mode = S.recipeMode[p.id] || 'standard'
-        const std = standardRecipe(p.id)
+      <p className="lead">Every part in this build. Choose standard or one of your unlocked alternate recipes for each. The list updates if an alternate changes which parts are needed.</p>
+      {items.map((id) => {
+        const alts = altRecipes(id)
+        const mode = S.recipeMode[id] === 'alt' && alts.length ? 'alt' : 'standard'
+        const std = standardRecipe(id)
         return (
-          <div className="card" key={p.id}>
-            <b>{nm(p.id)}</b>
+          <div className="card" key={id}>
+            <div className="row"><b className="grow">{nm(id)}</b><span className="tag">{productIds.includes(id) ? 'product' : 'part'}</span></div>
             <div className="seg">
-              <button className={mode === 'standard' ? 'on' : ''} onClick={() => set((s) => ({ recipeMode: { ...s.recipeMode, [p.id]: 'standard' } }))}>Standard</button>
-              <button className={mode === 'alt' ? 'on' : ''} disabled={!alts.length} onClick={() => set((s) => ({ recipeMode: { ...s.recipeMode, [p.id]: 'alt' } }))}>Alternative{!alts.length && ' (none)'}</button>
+              <button className={mode === 'standard' ? 'on' : ''} onClick={() => setMode(id, 'standard')}>Standard</button>
+              <button className={mode === 'alt' ? 'on' : ''} disabled={!alts.length} onClick={() => setMode(id, 'alt')}>
+                {alts.length ? `Alternative (${alts.length})` : 'No alternates'}
+              </button>
             </div>
             {mode === 'standard' && <div className="recipe muted">{BUILDINGS[std.b].n}: {io(std)} per min</div>}
             {mode === 'alt' && alts.map((r) => (
-              <label key={r.id} className={'opt' + (S.choice[p.id] === r.id ? ' on' : '')}>
-                <input type="radio" name={'alt' + p.id} checked={S.choice[p.id] === r.id} onChange={() => set((s) => ({ choice: { ...s.choice, [p.id]: r.id } }))} />
+              <label key={r.id} className={'opt' + (S.choice[id] === r.id ? ' on' : '')}>
+                <input type="radio" name={'alt' + id} checked={S.choice[id] === r.id} onChange={() => set((s) => ({ choice: { ...s.choice, [id]: r.id } }))} />
                 <div><b>{r.n.replace('Alternate: ', '')}</b> <span className="muted">· {BUILDINGS[r.b].n}</span><div className="recipe">{io(r)} per min</div></div>
               </label>
             ))}
+            {mode === 'alt' && !S.choice[id] && <div className="hint warn">Pick one of the alternates above.</div>}
           </div>
         )
       })}
@@ -189,12 +225,14 @@ function Recipes({ S, set }) {
   )
 }
 
-function Resources({ S, set, raw, avail, chains, beltCap, pipeCap }) {
+function Resources({ S, set, raw, avail, chains, beltCap, pipeCap, targetMode, need }) {
   const upd = (r, f) => set((s) => ({ supply: { ...s.supply, [r]: f({ nodes: [], ...(s.supply[r] || {}) }) } }))
   return (
     <section>
       <h2>Resources</h2>
-      <p className="lead">This chain needs {raw.map(nm).join(', ')}. Tell me what you have access to.</p>
+      {targetMode
+        ? <p className="lead">Here's what your targets need. Adding your nodes is optional – I'll check whether they're enough.</p>
+        : <p className="lead">This chain needs {raw.map(nm).join(', ')}. Tell me what you have access to.</p>}
       <div className="card row">
         <span className="grow">Best belt</span>
         <select value={S.belt} onChange={(e) => set({ belt: +e.target.value })}>{BELTS.map((b) => <option key={b.mk} value={b.mk}>Mk{b.mk} · {b.rate}/min</option>)}</select>
@@ -211,7 +249,15 @@ function Resources({ S, set, raw, avail, chains, beltCap, pipeCap }) {
         const perUnit = chains.reduce((a, c) => a + (c.raw[r] || 0), 0)
         return (
           <div className="card" key={r}>
-            <div className="row"><b className="grow">{nm(r)}</b><span className="tag">{Number.isFinite(avail[r]) ? fmt(avail[r], 1) : '∞'} {unit(r)} available</span></div>
+            <div className="row"><b className="grow">{nm(r)}</b>
+              {targetMode && <span className="tag">needs {fmt(need[r] || 0, 1)} {unit(r)}</span>}
+              {(!targetMode || avail[r] > 0) && <span className="tag">{Number.isFinite(avail[r]) ? fmt(avail[r], 1) : '∞'} {unit(r)} available</span>}
+            </div>
+            {targetMode && avail[r] > 0 && Number.isFinite(avail[r]) && (
+              avail[r] + 1e-6 >= (need[r] || 0)
+                ? <div className="hint ok">✓ Enough – {fmt(avail[r] - need[r], 1)} {unit(r)} to spare</div>
+                : <div className="hint warn">Short by {fmt(need[r] - avail[r], 1)} {unit(r)} – add nodes or lower the target</div>
+            )}
             {kind === 'water' && (
               <label className="check"><input type="checkbox" checked={s.unlimited !== false} onChange={(e) => upd(r, (x) => ({ ...x, unlimited: e.target.checked }))} /> Unlimited – I'll place Water Extractors as needed</label>
             )}
@@ -245,7 +291,7 @@ function Resources({ S, set, raw, avail, chains, beltCap, pipeCap }) {
               <input className="num small" type="number" min="0" placeholder="0" value={s.direct || ''} onChange={(e) => upd(r, (x) => ({ ...x, direct: e.target.value }))} />
               <span className="muted">{unit(r)}</span>
             </div>
-            <div className="hint">One {nm(chains[0]?.pid)} machine needs {fmt(chains[0]?.raw[r] || perUnit)} {unit(r)} of this.</div>
+            {!targetMode && <div className="hint">One {nm(chains[0]?.pid)} machine needs {fmt(chains[0]?.raw[r] || perUnit)} {unit(r)} of this.</div>}
           </div>
         )
       })}
@@ -282,26 +328,26 @@ function Priority({ S, set, shared }) {
   )
 }
 
-function Optimize({ S, set, products, choice, avail, prio }) {
+function Optimize({ S, set, products, choice, avail, prio, targetMode }) {
   const previews = useMemo(() => MODES.map((m) => {
-    try { return solve({ products, choice, avail, mode: m.id, prio }) } catch { return null }
-  }), [products, choice, avail, prio]) // eslint-disable-line react-hooks/exhaustive-deps
+    try { return solve({ products, choice, avail, mode: m.id, prio, targetMode }) } catch { return null }
+  }), [products, choice, avail, prio, targetMode]) // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <section>
       <h2>Optimize for</h2>
-      <p className="lead">Preview of what each goal produces with your resources.</p>
+      <p className="lead">{targetMode ? 'Preview of each goal for your target.' : 'Preview of what each goal produces with your resources.'}</p>
       {MODES.map((m, i) => {
         const p = previews[i]
         return (
           <label key={m.id} className={'opt' + (S.mode === m.id ? ' on' : '')}>
             <input type="radio" checked={S.mode === m.id} onChange={() => set({ mode: m.id })} />
-            <div className="grow"><b>{m.t}</b>{m.id === 'perfect' && <span className="tag">recommended</span>}
-              <div className="muted">{m.d}</div>
+            <div className="grow"><b>{targetMode && m.id === 'max' ? 'Exact target' : m.t}</b>{m.id === 'perfect' && <span className="tag">recommended</span>}
+              <div className="muted">{(targetMode && TARGET_DESC[m.id]) || m.d}</div>
               {p && (
                 <div className="preview">
                   {p.out.map((o) => <span key={o.id}>{nm(o.id)} <b>{fmt(o.rate, 1)}</b>/min</span>)}
                   <span>{p.machines} machines · {fmt(p.power, 0)} MW{p.shards ? ` · ${p.shards} shards` : ''}</span>
-                  {p.mode !== m.id && <span className="warn">No perfect build possible – falls back to max output</span>}
+                  {p.mode !== m.id && <span className="warn">{targetMode ? 'No perfect build near your target – uses exact target' : 'No perfect build possible – falls back to max output'}</span>}
                 </div>
               )}
             </div>
@@ -312,7 +358,7 @@ function Optimize({ S, set, products, choice, avail, prio }) {
   )
 }
 
-function Result({ plan, layout, avail }) {
+function Result({ plan, layout, avail, targetMode }) {
   return (
     <section>
       <h2>Production plan</h2>
@@ -343,10 +389,16 @@ function Result({ plan, layout, avail }) {
       <h3>Resources</h3>
       <table>
         <tbody>
-          {Object.entries(plan.rawUse).map(([r, q]) => (
-            <tr key={r}><td>{nm(r)}</td><td className="r">{fmt(q, 1)} / {Number.isFinite(avail[r]) ? fmt(avail[r], 1) : '∞'}
-              {Number.isFinite(avail[r]) && avail[r] - q > 0.05 && <div className="muted">{fmt(avail[r] - q, 1)} spare</div>}</td></tr>
-          ))}
+          {Object.entries(plan.rawUse).map(([r, q]) => {
+            const a = avail[r]
+            const known = Number.isFinite(a) && (a > 0 || !targetMode)
+            return (
+              <tr key={r}><td>{nm(r)}</td><td className="r">{fmt(q, 1)}{known ? ` / ${fmt(a, 1)}` : ''} {unit(r)}
+                {known && a - q > 0.05 && <div className="muted">{fmt(a - q, 1)} spare</div>}
+                {known && q - a > 0.05 && <div className="warn">short by {fmt(q - a, 1)}</div>}
+                {targetMode && !known && <div className="muted">needed</div>}</td></tr>
+            )
+          })}
         </tbody>
       </table>
       {Object.keys(plan.byproducts).length > 0 && <>

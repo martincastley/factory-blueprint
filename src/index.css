@@ -146,3 +146,5 @@ td.r { text-align: right; font-family: 'IBM Plex Mono'; font-size: 12px; }
 .tb-grid span, .tb-grid b { padding: 4px 10px; border-bottom: 1px solid var(--edge); }
 .tb-grid span { color: var(--mute); border-right: 1px solid var(--edge); }
 .tb-grid b { color: var(--ink); font-weight: 500; }
+.hint.ok { color: #7fe0a8; }
+input.need { border-color: var(--amber); }
